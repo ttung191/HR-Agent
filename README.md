@@ -1,70 +1,167 @@
-# INDA CV Intelligence Platform — Refactor 9/10
+# HR-Agent
 
-Bản này là một refactor production-minded của repo `ttung191/HR-Agent`, tập trung vào đúng 3 yêu cầu của đề:
+## Overview
 
-1. Bóc tách CV và lưu database theo schema rõ ràng.
-2. Tìm kiếm ứng viên theo năng lực và kinh nghiệm.
-3. Có giao diện cho recruiter tương tác.
+HR-Agent là một dự án sàng lọc CV dành cho quy trình tuyển dụng nội bộ. Hệ thống tập trung vào 4 phần chính:
 
-## Điểm nâng cấp chính
+- ingest CV từ file `.pdf`, `.docx`, `.txt`
+- trích xuất thông tin ứng viên từ nội dung CV
+- chuẩn hóa dữ liệu để lưu trữ và tìm kiếm
+- cung cấp giao diện web để upload, tra cứu, review và export dữ liệu ứng viên
 
-- **Schema quan hệ hóa** thay vì nhét gần hết dữ liệu vào JSON blob.
-- **Document / ExtractionRun / Candidate** tách riêng để audit được toàn bộ vòng đời parse.
-- **Skills / Experience / Education / Projects / Links** được lưu thành bảng riêng.
-- **Search 2 tầng**: SQL pre-filter rồi mới explainable scoring.
-- **Skill normalization** có alias map cho các công nghệ phổ biến.
-- **Review queue** rõ ràng hơn, confidence có căn cứ hơn.
-- **UI recruiter workflow**: upload, search, review, export.
-- **Test** cho normalize và search.
+Hiện tại repo bao gồm:
 
-## Cấu trúc
+- **FastAPI backend** để xử lý upload, parsing, search, review, analytics và export
+- **Streamlit dashboard** để thao tác thủ công qua giao diện web
+- **SQLAlchemy models** để lưu dữ liệu ứng viên vào database
+- **pipeline xử lý CV** gồm parse text, deduplicate, extract, normalize và search
+- **test cơ bản** cho normalizer và luồng smoke test
+
+---
+
+## What the project does
+
+Luồng xử lý hiện tại của dự án:
+
+1. Người dùng upload một hoặc nhiều CV
+2. Backend kiểm tra dung lượng file và tránh ingest lại file trùng bằng `SHA-256`
+3. File được parse text theo định dạng:
+   - PDF
+   - DOCX
+   - TXT
+4. Nếu PDF có chất lượng text thấp, hệ thống có thể thử OCR fallback
+5. Dữ liệu thô được đưa qua extractor để lấy ra các trường ứng viên
+6. Kết quả được normalize để suy ra:
+   - tên chuẩn hóa
+   - email / phone chính
+   - current title / current company
+   - số năm kinh nghiệm
+   - normalized skills
+   - review status
+   - confidence score
+7. Dữ liệu được lưu vào database
+8. Người dùng có thể:
+   - search ứng viên
+   - xem review queue
+   - cập nhật review status
+   - xem analytics
+   - export CSV
+
+---
+
+## Main features
+
+### 1. CV upload
+- upload 1 CV hoặc nhiều CV cùng lúc
+- hỗ trợ `.pdf`, `.docx`, `.txt`
+- chặn file quá dung lượng cấu hình
+- bỏ qua file trùng nội dung bằng hash
+
+### 2. Text parsing
+- parse text từ PDF
+- parse text từ DOCX
+- parse text từ TXT
+- có cơ chế OCR fallback cho PDF khi native extraction yếu
+
+### 3. Candidate extraction
+Extractor hiện tại tập trung vào:
+- full name
+- email
+- phone
+- summary
+- current title
+- current company
+- skills
+- experience
+- education
+- projects
+- social/profile links
+- detected sections
+
+### 4. Candidate normalization
+Normalizer xử lý:
+- chuẩn hóa email / phone
+- suy ra current title
+- suy ra current company
+- suy ra tổng số năm kinh nghiệm
+- chuẩn hóa skill list
+- tính confidence score
+- gán review status và review reasons
+
+### 5. Search and recruiter workflow
+- preview query plan từ câu query tuyển dụng
+- search ứng viên theo query
+- lọc review queue
+- cập nhật review status
+- xem duplicate groups
+- xem analytics
+- export dữ liệu ứng viên ra CSV
+
+### 6. Dashboard
+Dashboard Streamlit hiện có 4 tab:
+- Upload CV
+- Search Candidates
+- Review Queue
+- Analytics
+
+---
+
+## Tech stack
+
+### Backend
+- FastAPI
+- Uvicorn
+- SQLAlchemy
+- Pydantic
+- Pydantic Settings
+
+### Frontend
+- Streamlit
+
+### Data / Utility
+- SQLite mặc định
+- pandas
+- requests
+
+### File parsing
+- pdfplumber
+- python-docx
+
+### Testing
+- pytest
+
+---
+
+## Project structure
 
 ```text
-app/
-  api/main.py
-  core/
-  db/
-  models/
-  schemas/
-  services/
-  ui/dashboard.py
-tests/
-```
-
-## Chạy backend
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.api.main:app --reload
-```
-
-## Chạy frontend
-
-```bash
-streamlit run app/ui/dashboard.py
-```
-
-## API chính
-
-- `POST /api/v1/candidates/upload`
-- `POST /api/v1/candidates/upload-batch`
-- `GET /api/v1/candidates`
-- `GET /api/v1/candidates/{id}`
-- `POST /api/v1/search`
-- `POST /api/v1/query-plan`
-- `GET /api/v1/review-queue`
-- `POST /api/v1/review/{id}`
-- `GET /api/v1/duplicates`
-- `GET /api/v1/analytics`
-- `GET /api/v1/export.csv`
-
-## Gợi ý nâng tiếp để vượt 9/10 hẳn
-
-- Thêm PostgreSQL + FTS hoặc OpenSearch.
-- Bổ sung OCR thật và span-level evidence.
-- JD parser dùng LLM nhưng giữ fallback heuristic.
-- Background jobs cho batch ingest.
-- Human feedback loop để sửa alias/rules.
-- Benchmark với bộ CV thật của công ty.
+HR-Agent/
+├── app/
+│   ├── api/
+│   │   └── main.py
+│   ├── core/
+│   │   ├── config.py
+│   │   └── logging.py
+│   ├── db/
+│   │   └── session.py
+│   ├── models/
+│   │   └── candidate.py
+│   ├── schemas/
+│   │   └── candidate.py
+│   ├── services/
+│   │   ├── dedup.py
+│   │   ├── extractor.py
+│   │   ├── normalizer.py
+│   │   ├── parsers.py
+│   │   ├── query_parser.py
+│   │   ├── repository.py
+│   │   └── search.py
+│   └── ui/
+│       └── dashboard.py
+├── tests/
+│   ├── test_normalizer.py
+│   └── test_smoke.py
+├── .gitignore
+├── Dockerfile
+├── README.md
+└── requirements.txt
