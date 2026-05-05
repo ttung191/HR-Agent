@@ -59,6 +59,7 @@ class CandidateExtraction(BaseModel):
     primary_phone: ExtractedField
     date_of_birth: ExtractedField
     address: ExtractedField
+    city: ExtractedField = Field(default_factory=ExtractedField)
     summary: ExtractedField
     current_title: ExtractedField
     current_company: ExtractedField
@@ -105,6 +106,7 @@ class CandidateSummary(BaseModel):
     primary_email: str | None = None
     primary_phone: str | None = None
     address: str | None = None
+    city: str | None = None
     summary: str | None = None
     current_title: str | None = None
     current_company: str | None = None
@@ -114,6 +116,8 @@ class CandidateSummary(BaseModel):
     field_confidence: dict[str, float] = Field(default_factory=dict)
     review_status: str = "needs_review"
     review_reasons: list[str] = Field(default_factory=list)
+    parser_backend: str | None = None
+    parse_flags: list[str] = Field(default_factory=list)
     vector_document: str | None = None
     vector_metadata: VectorMetadata | None = None
     experiences: list[ExperienceItem] = Field(default_factory=list)

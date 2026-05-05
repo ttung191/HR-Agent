@@ -89,6 +89,9 @@ def _init_state() -> None:
         "last_jd_result": None,
         "last_candidate_detail": None,
         "selected_candidate_id": None,
+        "parser_strategy": "local",
+        "gemini_api_key": "",
+        "gemini_model": "gemini-2.5-flash",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -116,6 +119,7 @@ def _request(
     *,
     params: dict[str, Any] | None = None,
     json_body: dict[str, Any] | None = None,
+    data: dict[str, Any] | None = None,
     files: Any = None,
 ) -> tuple[bool, int | None, Any]:
     url = _build_url(api_base, path)
@@ -125,6 +129,7 @@ def _request(
             url=url,
             params=params,
             json=json_body,
+            data=data,
             files=files,
             timeout=TIMEOUT_SECONDS,
         )
@@ -166,6 +171,33 @@ def _render_chip_list(title: str, items: list[str] | None, empty_text: str = "Kh
         st.caption(empty_text)
         return
     st.write(" · ".join(items))
+
+
+def _parser_form_data() -> dict[str, Any]:
+    return {
+        "parser_strategy": st.session_state.get("parser_strategy", "local"),
+        "gemini_api_key": st.session_state.get("gemini_api_key", ""),
+        "gemini_model": st.session_state.get("gemini_model", "gemini-2.5-flash"),
+    }
+
+
+def _summarize_upload_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    candidate = payload.get("candidate") or {}
+    audit = payload.get("audit") or {}
+    extraction = payload.get("extraction") or {}
+    return {
+        "backend": audit.get("extractor_backend"),
+        "flags": audit.get("parse_flags", []),
+        "name": candidate.get("full_name") or extraction.get("full_name", {}).get("value"),
+        "email": candidate.get("primary_email") or extraction.get("primary_email", {}).get("value"),
+        "phone": candidate.get("primary_phone") or extraction.get("primary_phone", {}).get("value"),
+        "address": candidate.get("address") or extraction.get("address", {}).get("value"),
+        "city": candidate.get("city") or extraction.get("city", {}).get("value"),
+        "skills": candidate.get("normalized_skills") or [item.get("normalized_skill") for item in extraction.get("skills", []) if item.get("normalized_skill")],
+        "warnings": payload.get("warnings", []),
+    }
 
 
 def _refresh_candidates(api_base: str, *, quiet: bool = False) -> list[dict[str, Any]]:
@@ -286,7 +318,9 @@ def _render_overview(api_base: str) -> None:
 
 def _render_upload_page(api_base: str) -> None:
     st.markdown("### Upload & Parse Workspace")
-    st.caption("Bố cục mới ưu tiên nhìn rõ 3 thứ cùng lúc: queue file, action upload, và kết quả trả về gần nhất.")
+    parser_strategy = st.session_state.get("parser_strategy", "local")
+    parser_label = "Gemini ưu tiên, local fallback" if parser_strategy == "gemini_first" else "Heuristic parser nội bộ"
+    st.caption(f"Workspace parse mới: {parser_label}. Layout vẫn giữ flow test nhanh nhưng bổ sung parser strategy, Gemini key và preview trường trọng yếu.")
 
     left, right = st.columns([1.1, 0.9], gap="large")
 
@@ -313,6 +347,11 @@ def _render_upload_page(api_base: str) -> None:
                     )
                 st.dataframe(queue_rows, use_container_width=True, hide_index=True)
 
+            st.info(
+                f"Parser đang chọn: **{'Gemini first -> local fallback' if parser_strategy == 'gemini_first' else 'Local heuristic parser'}** | "
+                f"Model: **{st.session_state.get('gemini_model', 'gemini-2.5-flash')}**"
+            )
+
             action_cols = st.columns([1, 1, 1])
             with action_cols[0]:
                 run_single = st.button("Upload 1 CV", disabled=not uploaded_files or upload_mode != "Single", use_container_width=True)
@@ -324,14 +363,14 @@ def _render_upload_page(api_base: str) -> None:
             if run_single and uploaded_files:
                 first_file = uploaded_files[0]
                 files = {"file": (first_file.name, first_file.getvalue(), first_file.type or "application/octet-stream")}
-                ok, status_code, payload = _request("POST", api_base, "/api/v1/candidates/upload", files=files)
+                ok, status_code, payload = _request("POST", api_base, "/api/v1/candidates/upload", data=_parser_form_data(), files=files)
                 st.session_state["last_upload_result"] = {"ok": ok, "status_code": status_code, "payload": payload}
                 if ok:
                     _refresh_candidates(api_base, quiet=True)
 
             if run_batch and uploaded_files:
                 files = [("files", (item.name, item.getvalue(), item.type or "application/octet-stream")) for item in uploaded_files]
-                ok, status_code, payload = _request("POST", api_base, "/api/v1/candidates/upload-batch", files=files)
+                ok, status_code, payload = _request("POST", api_base, "/api/v1/candidates/upload-batch", data=_parser_form_data(), files=files)
                 st.session_state["last_upload_result"] = {"ok": ok, "status_code": status_code, "payload": payload}
                 if ok:
                     _refresh_candidates(api_base, quiet=True)
@@ -346,6 +385,23 @@ def _render_upload_page(api_base: str) -> None:
             last_upload = st.session_state.get("last_upload_result")
             if last_upload:
                 _show_response(last_upload["ok"], last_upload["status_code"], last_upload["payload"])
+                summary = _summarize_upload_payload(last_upload.get("payload"))
+                if summary:
+                    st.markdown("#### Snapshot trường trọng yếu")
+                    st.dataframe(
+                        [
+                            {"field": "Tên", "value": summary.get("name")},
+                            {"field": "Email", "value": summary.get("email")},
+                            {"field": "Số điện thoại", "value": summary.get("phone")},
+                            {"field": "Địa chỉ", "value": summary.get("address")},
+                            {"field": "Thành phố", "value": summary.get("city")},
+                            {"field": "Parser backend", "value": summary.get("backend")},
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    _render_chip_list("Skills", summary.get("skills"), empty_text="Không có skill parse được")
+                    _render_chip_list("Parse flags", summary.get("flags"), empty_text="Không có parse flag")
             else:
                 st.info("Chưa có request upload nào trong session này.")
 
@@ -479,6 +535,9 @@ def _render_candidate_explorer(api_base: str) -> None:
                             "email": selected_candidate.get("primary_email"),
                             "phone": selected_candidate.get("primary_phone"),
                             "address": selected_candidate.get("address"),
+                            "city": selected_candidate.get("city"),
+                            "parser_backend": selected_candidate.get("parser_backend"),
+                            "parse_flags": selected_candidate.get("parse_flags"),
                         }
                     )
                 with subtab2:
@@ -760,6 +819,20 @@ with st.sidebar:
     api_base = st.text_input("API Base URL", value=DEFAULT_API_BASE)
     st.caption("Chạy FastAPI trước: python -m uvicorn app.api.main:app --reload")
     st.divider()
+    parser_choice = st.radio(
+        "Parser strategy",
+        options=["Local heuristic parser", "Gemini first -> local fallback"],
+        index=0 if st.session_state.get("parser_strategy", "local") == "local" else 1,
+    )
+    st.session_state["parser_strategy"] = "gemini_first" if parser_choice.startswith("Gemini") else "local"
+    st.session_state["gemini_model"] = st.text_input("Gemini model", value=st.session_state.get("gemini_model", "gemini-2.5-flash"))
+    st.session_state["gemini_api_key"] = st.text_input(
+        "Gemini API key",
+        value=st.session_state.get("gemini_api_key", ""),
+        type="password",
+        help="Chỉ dùng khi bật parser Gemini. Nếu hết quota hoặc lỗi API, hệ thống sẽ tự quay về local parser.",
+    )
+    st.divider()
     page = st.radio(
         "Điều hướng",
         options=[
@@ -782,7 +855,8 @@ with st.sidebar:
         """
         **Tính năng có trong layout này**
         - health + query plan
-        - upload single / batch
+        - upload single / batch với parser strategy
+        - local parser + Gemini fallback
         - candidate explorer
         - hybrid search
         - JD matching

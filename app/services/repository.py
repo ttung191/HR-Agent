@@ -240,6 +240,7 @@ class CandidateRepository:
                 "full_name",
                 "primary_email",
                 "primary_phone",
+                "city",
                 "current_title",
                 "current_company",
                 "total_years_experience",
@@ -256,6 +257,7 @@ class CandidateRepository:
                     summary.full_name,
                     summary.primary_email,
                     summary.primary_phone,
+                    summary.city,
                     summary.current_title,
                     summary.current_company,
                     summary.total_years_experience,
@@ -296,6 +298,7 @@ def to_candidate_summary(row: Candidate) -> CandidateSummary:
             metadata = {}
 
     latest_run = None
+    audit_payload: dict[str, Any] = {}
     if row.extraction_runs:
         latest_run = sorted(row.extraction_runs, key=lambda item: item.created_at or row.created_at)[-1]
         schema_version = latest_run.schema_version or schema_version
@@ -304,6 +307,11 @@ def to_candidate_summary(row: Candidate) -> CandidateSummary:
                 normalized_profile = json.loads(latest_run.normalized_profile_json)
             except Exception:
                 normalized_profile = {}
+        if latest_run.audit_json:
+            try:
+                audit_payload = json.loads(latest_run.audit_json)
+            except Exception:
+                audit_payload = {}
 
     return CandidateSummary(
         id=row.id,
@@ -312,6 +320,7 @@ def to_candidate_summary(row: Candidate) -> CandidateSummary:
         primary_email=row.primary_email,
         primary_phone=row.primary_phone,
         address=row.address,
+        city=normalized_profile.get("city"),
         summary=row.summary,
         current_title=row.current_title,
         current_company=row.current_company,
@@ -321,6 +330,8 @@ def to_candidate_summary(row: Candidate) -> CandidateSummary:
         field_confidence=normalized_profile.get("field_confidence") or {},
         review_status=row.review_status,
         review_reasons=normalized_profile.get("review_reasons") or ([row.review_reason] if row.review_reason else []),
+        parser_backend=audit_payload.get("extractor_backend"),
+        parse_flags=audit_payload.get("parse_flags") or [],
         vector_document=row.vector_document,
         vector_metadata=VectorMetadata.model_validate(metadata) if metadata else None,
         experiences=[

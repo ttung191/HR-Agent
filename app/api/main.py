@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
@@ -19,9 +19,8 @@ from app.schemas.candidate import (
     UploadResult,
 )
 from app.services.dedup import build_duplicate_key, file_sha256
-from app.services.extractor import HybridExtractor
 from app.services.matching import JDMatcher
-from app.services.normalizer import normalize_candidate
+from app.services.parser_orchestrator import ParserOptions, ParserOrchestrator
 from app.services.parsers import UnsupportedFileTypeError, extract_text
 from app.services.query_parser import QueryPlanner
 from app.services.repository import CandidateRepository, to_candidate_summary
@@ -47,7 +46,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-extractor = HybridExtractor()
+parser_orchestrator = ParserOrchestrator()
 planner = QueryPlanner()
 
 
@@ -71,13 +70,16 @@ def _sync_candidate_vector(db: Session, candidate) -> None:
     db.commit()
 
 
-def _parse_and_normalize(raw_text: str, filename: str, parser_meta: dict):
-    extraction, audit = extractor.extract(raw_text, filename=filename, parser_meta=parser_meta)
-    normalized = normalize_candidate(extraction, audit)
-    return extraction, audit, normalized
+def _parse_and_normalize(raw_text: str, filename: str, parser_meta: dict, parser_options: ParserOptions):
+    return parser_orchestrator.parse_and_normalize(
+        raw_text,
+        filename=filename,
+        parser_meta=parser_meta,
+        options=parser_options,
+    )
 
 
-def _process_file(file_bytes: bytes, filename: str, db: Session) -> UploadResult:
+def _process_file(file_bytes: bytes, filename: str, db: Session, parser_options: ParserOptions) -> UploadResult:
     _validate_upload(file_bytes, filename)
     repo = CandidateRepository(db)
     digest = file_sha256(file_bytes)
@@ -98,7 +100,7 @@ def _process_file(file_bytes: bytes, filename: str, db: Session) -> UploadResult
     if len(parse_result.text.strip()) < settings.min_text_length:
         raise HTTPException(status_code=422, detail="Extracted text is too short for reliable CV parsing")
 
-    extraction, audit, normalized = _parse_and_normalize(parse_result.text, filename, parse_result.parser_meta)
+    extraction, audit, normalized = _parse_and_normalize(parse_result.text, filename, parse_result.parser_meta, parser_options)
     candidate = repo.create_candidate_bundle(
         normalized=normalized,
         extraction_json=extraction.model_dump(),
@@ -128,7 +130,7 @@ def _process_file(file_bytes: bytes, filename: str, db: Session) -> UploadResult
     )
 
 
-def _reparse_candidate(candidate_id: int, db: Session):
+def _reparse_candidate(candidate_id: int, db: Session, parser_options: ParserOptions):
     repo = CandidateRepository(db)
     row = repo.get(candidate_id)
     if not row:
@@ -138,7 +140,7 @@ def _reparse_candidate(candidate_id: int, db: Session):
 
     document = sorted(row.documents, key=lambda item: item.created_at, reverse=True)[0]
     parser_meta = json.loads(document.parser_meta_json or "{}") if document.parser_meta_json else {}
-    extraction, audit, normalized = _parse_and_normalize(document.raw_text, document.source_filename, parser_meta)
+    extraction, audit, normalized = _parse_and_normalize(document.raw_text, document.source_filename, parser_meta, parser_options)
     updated = repo.reparse_candidate_bundle(
         candidate_id=candidate_id,
         normalized=normalized,
@@ -157,7 +159,7 @@ def _reparse_candidate(candidate_id: int, db: Session):
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "version": settings.app_version}
+    return {"status": "ok", "version": settings.app_version, "default_parser_strategy": settings.default_parser_strategy}
 
 
 @app.get("/api/v1/query-plan")
@@ -166,10 +168,21 @@ def preview_query_plan(query: str):
 
 
 @app.post("/api/v1/candidates/upload")
-async def upload_candidate(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_candidate(
+    file: UploadFile = File(...),
+    parser_strategy: str = Form("local"),
+    gemini_api_key: str | None = Form(None),
+    gemini_model: str | None = Form(None),
+    db: Session = Depends(get_db),
+):
+    parser_options = ParserOptions.from_inputs(
+        parser_strategy=parser_strategy,
+        gemini_api_key=gemini_api_key,
+        gemini_model=gemini_model,
+    )
     try:
         file_bytes = await file.read()
-        result = _process_file(file_bytes, file.filename or "uploaded_cv", db)
+        result = _process_file(file_bytes, file.filename or "uploaded_cv", db, parser_options)
         return result.model_dump()
     except UnsupportedFileTypeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -180,12 +193,23 @@ async def upload_candidate(file: UploadFile = File(...), db: Session = Depends(g
 
 
 @app.post("/api/v1/candidates/upload-batch")
-async def upload_batch(files: list[UploadFile] = File(...), db: Session = Depends(get_db)):
+async def upload_batch(
+    files: list[UploadFile] = File(...),
+    parser_strategy: str = Form("local"),
+    gemini_api_key: str | None = Form(None),
+    gemini_model: str | None = Form(None),
+    db: Session = Depends(get_db),
+):
+    parser_options = ParserOptions.from_inputs(
+        parser_strategy=parser_strategy,
+        gemini_api_key=gemini_api_key,
+        gemini_model=gemini_model,
+    )
     results: list[BatchUploadResult] = []
     for file in files:
         try:
             file_bytes = await file.read()
-            result = _process_file(file_bytes, file.filename or "uploaded_cv", db)
+            result = _process_file(file_bytes, file.filename or "uploaded_cv", db, parser_options)
             results.append(
                 BatchUploadResult(
                     filename=file.filename or "uploaded_cv",
@@ -202,22 +226,44 @@ async def upload_batch(files: list[UploadFile] = File(...), db: Session = Depend
 
 
 @app.post("/api/v1/candidates/reparse-all")
-def reparse_all(db: Session = Depends(get_db)):
+def reparse_all(
+    parser_strategy: str = "local",
+    gemini_api_key: str | None = None,
+    gemini_model: str | None = None,
+    db: Session = Depends(get_db),
+):
+    parser_options = ParserOptions.from_inputs(
+        parser_strategy=parser_strategy,
+        gemini_api_key=gemini_api_key,
+        gemini_model=gemini_model,
+    )
     repo = CandidateRepository(db)
     updated = 0
     failed: list[dict] = []
-    for candidate in repo.list_all():
+    rows = repo.list_all()
+    for candidate in rows:
         try:
-            _reparse_candidate(candidate.id, db)
+            _reparse_candidate(candidate.id, db, parser_options)
             updated += 1
         except Exception as exc:
             failed.append({"candidate_id": candidate.id, "error": str(exc)})
-    return {"total_candidates": len(repo.list_all()), "reparsed": updated, "failed": failed}
+    return {"total_candidates": len(rows), "reparsed": updated, "failed": failed}
 
 
 @app.post("/api/v1/candidates/{candidate_id}/reparse")
-def reparse_candidate(candidate_id: int, db: Session = Depends(get_db)):
-    return _reparse_candidate(candidate_id, db)
+def reparse_candidate(
+    candidate_id: int,
+    parser_strategy: str = "local",
+    gemini_api_key: str | None = None,
+    gemini_model: str | None = None,
+    db: Session = Depends(get_db),
+):
+    parser_options = ParserOptions.from_inputs(
+        parser_strategy=parser_strategy,
+        gemini_api_key=gemini_api_key,
+        gemini_model=gemini_model,
+    )
+    return _reparse_candidate(candidate_id, db, parser_options)
 
 
 @app.post("/api/v1/candidates/rebuild-vectors")

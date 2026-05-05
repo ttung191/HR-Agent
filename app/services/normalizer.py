@@ -47,6 +47,14 @@ def canonical_location(value: str | None) -> str | None:
     return value.strip()
 
 
+def infer_city(*values: str | None) -> str | None:
+    for value in values:
+        canonical = canonical_location(value)
+        if canonical:
+            return canonical
+    return None
+
+
 def canonical_degree(value: str | None) -> str | None:
     if not value:
         return None
@@ -381,6 +389,7 @@ def build_searchable_text(
     canonical_title: str | None,
     current_company: str | None,
     address: str | None,
+    city: str | None,
     skills: list[str],
     experiences: list[dict],
     projects: list[dict],
@@ -393,6 +402,7 @@ def build_searchable_text(
         canonical_title,
         current_company,
         address,
+        city,
         " ".join(skills),
         " ".join(
             filter(
@@ -442,7 +452,7 @@ def build_vector_document(profile: dict) -> str:
         f"title: {profile.get('current_title') or ''}",
         f"role: {profile.get('canonical_role') or ''}",
         f"company: {profile.get('current_company') or ''}",
-        f"location: {profile.get('canonical_location') or profile.get('address') or ''}",
+        f"location: {profile.get('canonical_location') or profile.get('city') or profile.get('address') or ''}",
         f"years_experience: {profile.get('total_years_experience') or ''}",
         f"skills: {', '.join(profile.get('normalized_skills') or [])}",
         f"summary: {profile.get('summary') or ''}",
@@ -458,7 +468,7 @@ def build_vector_metadata(profile: dict) -> VectorMetadata:
     formal_education = [item for item in profile.get("education", []) if _is_formal_education(item)]
     degrees = sorted({edu.get("degree") for edu in formal_education if edu.get("degree")})
     majors = sorted({edu.get("major") for edu in formal_education if edu.get("major")})
-    locations = sorted({loc for loc in [profile.get("canonical_location") or profile.get("address")] if loc})
+    locations = sorted({loc for loc in [profile.get("canonical_location"), profile.get("city"), profile.get("address")] if loc})
     return VectorMetadata(
         role=profile.get("canonical_role"),
         title=profile.get("current_title"),
@@ -581,7 +591,11 @@ def normalize_candidate(extraction: CandidateExtraction, audit: ExtractionAudit 
     total_years = round(total_months / 12.0, 2) if total_months > 0 else None
 
     address = normalize_text(extraction.address.value)
-    canonical_loc = canonical_location(address) if address else None
+    city = normalize_text(extraction.city.value)
+    if not city:
+        experience_cities = [canonical_location(item.get("location")) for item in normalized_experiences if item.get("location")]
+        city = infer_city(address, *experience_cities)
+    canonical_loc = infer_city(address, city) if address or city else None
 
     if _looks_like_sentence(current_title):
         current_title = None
@@ -623,6 +637,7 @@ def normalize_candidate(extraction: CandidateExtraction, audit: ExtractionAudit 
         "primary_phone": normalize_text(extraction.primary_phone.value),
         "date_of_birth": normalize_text(extraction.date_of_birth.value),
         "address": address,
+        "city": city,
         "canonical_location": canonical_loc,
         "summary": normalize_text(extraction.summary.value),
         "current_title": current_title,
@@ -642,6 +657,7 @@ def normalize_candidate(extraction: CandidateExtraction, audit: ExtractionAudit 
             canonical_title=canonical_current_title,
             current_company=current_company,
             address=address,
+            city=city,
             skills=normalized_skills,
             experiences=normalized_experiences,
             projects=normalized_projects,
@@ -653,6 +669,7 @@ def normalize_candidate(extraction: CandidateExtraction, audit: ExtractionAudit 
             "overall": confidence,
             "name": extraction.full_name.confidence,
             "contact": _blend([extraction.primary_email.confidence, extraction.primary_phone.confidence]),
+            "city": 0.88 if city else 0.0,
             "skills": min(0.96, 0.45 + 0.05 * len(normalized_skills)) if normalized_skills else 0.0,
             "experience": _blend([_experience_quality(item) for item in normalized_experiences]) if normalized_experiences else 0.0,
             "education": _blend([_education_quality(item) for item in normalized_educations]) if normalized_educations else 0.0,
